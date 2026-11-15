@@ -1444,5 +1444,136 @@ async function copyRules(){
 document.addEventListener('DOMContentLoaded',()=>{ applyLogo(); setLoading('Connecting to Firebase…'); });
 window.addEventListener('beforeunload',e=>{ if(settingsDirty){ e.preventDefault(); e.returnValue=''; } });
 </script>
+<script>
+/* TRIX Admin add-ons — add a script tag pointing to this file just before the closing body tag of the backend page (or run merge_admin.py) */
+(function(){
+'use strict';
+
+/* ---------- 4. solid #1a56db backgrounds + small styles ---------- */
+const st=document.createElement('style');
+st.textContent=`
+#loading-overlay,.auth-screen,.maint-screen{background:#1a56db !important}
+.stat-card.clk{cursor:pointer;transition:transform .12s,box-shadow .12s}
+.stat-card.clk:hover{transform:translateY(-2px);box-shadow:var(--shadow-lg)}
+.add-user-panel{display:none;background:var(--gray-light);border-radius:var(--radius);padding:18px;margin-bottom:16px}
+.add-user-panel.show{display:block}
+.le-add{display:flex;gap:8px;margin:8px 0}
+.le-add input{flex:1;padding:8px 12px;border:1.5px solid var(--border);border-radius:var(--radius-sm);font-size:14px;outline:none}
+.le-list{max-height:340px;overflow:auto;border:1px solid var(--border);border-radius:var(--radius-sm)}
+.le-row{display:flex;align-items:center;gap:10px;padding:7px 12px;border-bottom:1px solid var(--border)}
+.le-row:last-child{border-bottom:none}
+.le-row .le-name{flex:1;font-size:14px}
+.le-row.off .le-name{color:var(--muted);text-decoration:line-through}
+`;
+document.head.appendChild(st);
+
+/* ---------- 1. Dashboard: every status box, click = open those bookings ---------- */
+const ICONS={'Booked':'📝','Picked':'🙌','In-Transit':'🚚','Arrived at Destination':'📍','Out For Delivery':'🛵','Delivered':'✅','Consignee Refused':'🚫','Cancelled by Shipper':'❌','Delivery Failed':'⚠️','Re-Attempt':'🔁','Returned':'↩️','Return Delivered to Shipper':'📬'};
+window.goStatus=function(s){
+  showPage('bookings'); clearBookingFilters();
+  document.getElementById('b-status').value=s; renderBookings();
+};
+window.renderOverview=function(){
+  const counts={}; allParcels.forEach(p=>{counts[p.status]=(counts[p.status]||0)+1;});
+  const box=(icon,bg,label,val,click)=>`<div class="stat-card clk" onclick="${click}"><div class="stat-icon" style="background:${bg}">${icon}</div><div class="stat-info"><div class="label">${esc(label)}</div><div class="val">${val}</div></div></div>`;
+  document.getElementById('ov-stats').innerHTML=
+    box('📦','#e8f0fe','Total Parcels',allParcels.length,"goStatus('')")+
+    STATUSES.map(s=>box(ICONS[s.key]||'📦','rgba(0,0,0,.05)',s.key,counts[s.key]||0,"goStatus(this.dataset.s)").replace('class="stat-card clk"',`class="stat-card clk" data-s="${esc(s.key)}"`)).join('')+
+    box('👥','var(--purple-light)','Users',allUsers.length,"showPage('users')");
+  document.getElementById('q-booking').checked=siteSettings.booking.open;
+  document.getElementById('q-registration').checked=siteSettings.access.registrationOpen;
+  document.getElementById('q-maintenance').checked=siteSettings.access.maintenance;
+  const recent=allParcels.slice(0,8), wrap=document.getElementById('ov-recent');
+  if(!recent.length){ wrap.innerHTML='<div class="no-result"><div class="nr-icon">📭</div><p>No bookings yet.</p></div>'; return; }
+  wrap.innerHTML=`<table><thead><tr><th>Tracking ID</th><th>Booking Date</th><th>Shipper</th><th>Consignee</th><th>Status</th></tr></thead><tbody>${
+    recent.map(p=>`<tr><td class="td-id" onclick="openBooking('${p.id}')">${esc(p.id)}</td><td>${fmtBookingDate(p)}</td><td>${esc(p.sName)}<br><span style="font-size:11px;color:var(--muted)">${esc(p.sCity)}</span></td><td>${esc(p.rName)}<br><span style="font-size:11px;color:var(--muted)">${esc(p.rCity)}</span></td><td>${badge(p.status)}</td></tr>`).join('')}</tbody></table>`;
+};
+
+/* ---------- 2. Add new user (Auth account + profile in Firebase "users") ---------- */
+const usersCard=document.querySelector('#page-users .card');
+const panel=document.createElement('div');
+panel.innerHTML=`
+<div style="display:flex;justify-content:flex-end;margin-bottom:12px"><button class="btn btn-primary btn-sm" onclick="document.getElementById('add-user-panel').classList.toggle('show')">➕ Add New User</button></div>
+<div class="add-user-panel" id="add-user-panel">
+  <div class="form-grid">
+    <div class="form-group"><label>Full Name *</label><input type="text" id="nu-name" placeholder="Muhammad Ali"></div>
+    <div class="form-group"><label>Email *</label><input type="email" id="nu-email" placeholder="user@email.com"></div>
+    <div class="form-group"><label>Phone *</label><input type="text" id="nu-phone" placeholder="0300-1234567"></div>
+    <div class="form-group"><label>Password * (min 6)</label><input type="text" id="nu-pass" placeholder="Set a password"></div>
+    <div class="form-group full"><label>Address *</label><input type="text" id="nu-address" placeholder="House No, Street, City"></div>
+    <div class="form-group"><label>Role</label><select id="nu-role"><option value="user">User (customer)</option><option value="admin">Admin</option></select></div>
+  </div>
+  <div class="form-actions"><button class="btn btn-secondary btn-sm" onclick="document.getElementById('add-user-panel').classList.remove('show')">Cancel</button><button class="btn btn-primary btn-sm" id="nu-btn" onclick="addUser()">Create User</button></div>
+  <div class="alert" id="nu-alert"></div>
+</div>`;
+usersCard.insertBefore(panel,usersCard.querySelector('.filters-bar'));
+window.addUser=async function(){
+  const g=id=>document.getElementById(id).value.trim(), al=document.getElementById('nu-alert');
+  const name=g('nu-name'),email=g('nu-email'),phone=g('nu-phone'),address=g('nu-address'),pass=document.getElementById('nu-pass').value,role=g('nu-role');
+  const bad=m=>{al.className='alert alert-error show';al.textContent=m;};
+  if(!name||!email||!phone||!address||!pass) return bad('Please fill in all fields.');
+  if(pass.length<6) return bad('Password must be at least 6 characters.');
+  al.className='alert'; setBtnLoading('nu-btn',true,'Create User');
+  try{
+    // a second Firebase app creates the login, so the admin stays signed in
+    const app2=firebase.apps.find(a=>a.name==='adder')||firebase.initializeApp(firebaseConfig,'adder');
+    const cred=await app2.auth().createUserWithEmailAndPassword(email,pass);
+    try{
+      await db.ref('users/'+cred.user.uid).set({name,email,phone,address,role,createdAt:new Date().toISOString(),addedBy:(currentUser&&currentUser.email)||''});
+    }catch(e){ bad('Login was created but the profile could not be saved: '+e.message+' (check the Firebase rules).'); await app2.auth().signOut(); setBtnLoading('nu-btn',false,'Create User'); return; }
+    await app2.auth().signOut();
+    ['nu-name','nu-email','nu-phone','nu-address','nu-pass'].forEach(id=>document.getElementById(id).value='');
+    al.className='alert alert-success show'; al.textContent='User created: '+email;
+    showToast('User added','success');
+  }catch(e){ bad(fbErr(e)); }
+  setBtnLoading('nu-btn',false,'Create User');
+};
+
+/* ---------- 3. Booking tab: add / turn on-off / delete cities & parcel types ---------- */
+DEFAULT_SETTINGS.booking.citiesOff=[];            // disabled items are kept here (customer site only reads the enabled lists)
+DEFAULT_SETTINGS.booking.parcelTypesOff=[];
+const LBL={cities:'Cities',parcelTypes:'Parcel types'};
+function lists(key){ const b=draft.booking; return {on:b[key], off:(b[key+'Off']=b[key+'Off']||[])}; }
+function editorHTML(key){
+  const {on,off}=lists(key);
+  const row=(n,i,isOn)=>`<div class="le-row ${isOn?'':'off'}"><span class="le-name">${esc(n)}</span><label class="switch" title="${isOn?'Turn off':'Turn on'}"><input type="checkbox" ${isOn?'checked':''} onchange="leToggle('${key}',${i},${isOn})"><span class="slider"></span></label><button class="btn btn-danger btn-xs" onclick="leDel('${key}',${i},${isOn})">✕</button></div>`;
+  return `<label>${LBL[key]} <span class="hint">(${on.length} on · ${off.length} off)</span></label>
+  <div class="le-add"><input type="text" id="le-in-${key}" placeholder="Add new… (comma separated for many)" onkeydown="if(event.key==='Enter')leAdd('${key}')"><button class="btn btn-primary btn-sm" onclick="leAdd('${key}')">Add</button></div>
+  <div class="le-list">${on.map((n,i)=>row(n,i,true)).join('')}${off.map((n,i)=>row(n,i,false)).join('')}</div>`;
+}
+function leRefresh(key){ const e=document.getElementById('le-box-'+key); if(e) e.innerHTML=editorHTML(key); }
+window.leAdd=function(key){
+  const inp=document.getElementById('le-in-'+key), {on,off}=lists(key);
+  const have=new Set(on.concat(off).map(x=>x.toLowerCase()));
+  inp.value.split(/[,\n]/).map(x=>x.trim()).filter(Boolean).forEach(n=>{ if(!have.has(n.toLowerCase())){ on.push(n); have.add(n.toLowerCase()); } });
+  setDirty(true); leRefresh(key); const i2=document.getElementById('le-in-'+key); if(i2) i2.focus();
+};
+window.leToggle=function(key,i,isOn){ const {on,off}=lists(key); const [it]=(isOn?on:off).splice(i,1); (isOn?off:on).push(it); setDirty(true); leRefresh(key); };
+window.leDel=function(key,i,isOn){ const {on,off}=lists(key); (isOn?on:off).splice(i,1); setDirty(true); leRefresh(key); };
+
+const _render=window.renderSettings;
+window.renderSettings=function(){
+  _render();
+  if(settingsTab!=='booking') return;
+  document.querySelectorAll('#set-body textarea').forEach(ta=>{
+    const o=ta.getAttribute('oninput')||'', key=o.includes('booking.cities')?'cities':(o.includes('booking.parcelTypes')?'parcelTypes':null);
+    if(!key) return;
+    const box=ta.parentElement; box.id='le-box-'+key; box.innerHTML=editorHTML(key);
+  });
+};
+// saving: the original code saves the enabled lists; the disabled ones are stored next to them
+const _save=window.saveSettings;
+window.saveSettings=async function(){
+  const co=[...(draft.booking.citiesOff||[])], po=[...(draft.booking.parcelTypesOff||[])];
+  await _save();
+  if(settingsDirty) return;                              // validation/permission error - nothing saved
+  try{
+    await db.ref('settings/booking/citiesOff').set(co.length?co:null);
+    await db.ref('settings/booking/parcelTypesOff').set(po.length?po:null);
+  }catch(e){ permissionHint(e); }
+};
+})();
+
+</script>
 </body>
 </html>
