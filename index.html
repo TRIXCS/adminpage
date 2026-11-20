@@ -467,6 +467,12 @@ input[type=checkbox]{width:15px;height:15px;cursor:pointer;accent-color:var(--bl
       <div class="quick-row"><div><b>Maintenance mode</b><span class="hint">When on, customers only see the maintenance screen</span></div><label class="switch"><input type="checkbox" id="q-maintenance" onchange="quickToggle('access/maintenance',this.checked)"><span class="slider"></span></label></div>
     </div>
     <div class="card">
+      <div class="card-title">Public Tracking</div>
+      <div class="card-sub">Visitors who track without logging in see a safe copy (status, cities, timeline only — no phone, address or amount). It updates automatically whenever you change a status here. Press Sync once to create copies for parcels booked before this feature.</div>
+      <button class="btn btn-primary btn-sm" id="sync-pt-btn" onclick="syncPublicTracking()">Sync existing parcels</button>
+      <span class="hint" id="sync-pt-msg" style="margin-left:10px"></span>
+    </div>
+    <div class="card">
       <div class="card-title">Recent Bookings</div>
       <div class="card-sub">Latest 8 bookings — click a Tracking ID to open it</div>
       <div class="table-wrap" id="ov-recent"></div>
@@ -556,7 +562,7 @@ const DEFAULT_SETTINGS = {
     cities:['Karachi','Lahore','Islamabad','Rawalpindi','Faisalabad','Multan','Peshawar','Quetta','Hyderabad','Sialkot','Gujranwala','Sukkur','Bahawalpur','Abbottabad','Sargodha','Dera Ghazi Khan','Mardan','Larkana','Sheikhupura','Jhang','Rahim Yar Khan','Gujrat','Kasur','Mingora','Nawabshah'],
     parcelTypes:['Documents','Electronics','Clothing','Food','Medicine','Cosmetics','Fragile','Other']
   },
-  access:{ registrationOpen:true, maintenance:false, maintenanceMessage:'We are performing scheduled maintenance. Please check back soon.' },
+  access:{ registrationOpen:true, maintenance:false, maintenanceMessage:'We are performing scheduled maintenance. Please check back soon.', idleMinutes:'15' },
   contact:{ phone:'', email:'', whatsapp:'', hours:'' }
 };
 
@@ -898,17 +904,23 @@ function buildSlipsPrintDocument(parcels){
 }
 
 function fbErr(e){
+  const code=(e&&e.code)||'';
   const m={
     'auth/invalid-email':'Invalid email address.',
-    'auth/user-not-found':'No account found with this email.',
-    'auth/wrong-password':'Incorrect password.',
+    'auth/user-not-found':'Incorrect email or password.',
+    'auth/wrong-password':'Incorrect email or password.',
+    'auth/invalid-credential':'Incorrect email or password.',
+    'auth/invalid-login-credentials':'Incorrect email or password.',
+    'auth/user-disabled':'This account has been disabled. Please contact support.',
     'auth/email-already-in-use':'This email is already registered.',
     'auth/weak-password':'Password is too weak.',
     'auth/too-many-requests':'Too many attempts. Please try again later.',
-    'auth/network-request-failed':'Network error. Please check your internet connection.',
-    'auth/invalid-credential':'Incorrect email or password.',
+    'auth/network-request-failed':'Network error. Please check your internet connection.'
   };
-  return m[e.code]||e.message||'Something went wrong.';
+  if(m[code]) return m[code];
+  const msg=String((e&&e.message)||'');
+  if(/invalid[-_ ]login[-_ ]credentials|invalid[-_ ]credential|wrong[-_ ]password|user[-_ ]not[-_ ]found/i.test(msg)) return 'Incorrect email or password.';
+  return 'Something went wrong. Please try again.';
 }
 
 function applyLogo(){
@@ -986,7 +998,7 @@ function showScreen(name){
 // ── login / logout / access check ──
 auth.onAuthStateChanged(async fbUser=>{
   if(!fbUser){
-    currentUser=null; userProfile=null; stopListeners(); setDrawer(false); showScreen('login'); return;
+    idleStop(); currentUser=null; userProfile=null; stopListeners(); setDrawer(false); showScreen('login'); return;
   }
   currentUser=fbUser;
   let snap=null;
@@ -997,17 +1009,54 @@ auth.onAuthStateChanged(async fbUser=>{
     userProfile={name:'Admin',email:fbUser.email,role:(fbUser.email||'').toLowerCase()===ADMIN_EMAIL?'admin':'user'};
     profileMissing=true;
   }
-  if(userProfile.role!=='admin'){ stopListeners(); showScreen('denied'); return; }
-  showScreen('app');
+  if(userProfile.role!=='admin'){ idleStop(); stopListeners(); showScreen('denied'); return; }
+  showScreen('app'); idleStart();
   setupUI(); startListeners(); initDrawer(); showPage('overview');
 });
 async function doLogin(){
   const email=v('login-email'), pass=document.getElementById('login-pass').value;
   if(!email||!pass){ showErr('login-err','Please enter your email and password.'); return; }
   hideErr('login-err'); setBtnLoading('login-btn',true,'Login');
-  try{ await auth.signInWithEmailAndPassword(email,pass); }
+  try{ idleTouch(true); await auth.signInWithEmailAndPassword(email,pass); }
   catch(e){ showErr('login-err',fbErr(e)); setBtnLoading('login-btn',false,'Login'); }
 }
+
+// ══════════════════════════════════════════
+//  AUTO LOGOUT AFTER INACTIVITY
+//  Time (minutes) is set in the admin panel: Settings → Access. 0 = never.
+// ══════════════════════════════════════════
+const IDLE_KEY='trix_last_activity';
+const IDLE_EVTS=['mousemove','mousedown','keydown','touchstart','scroll','click'];
+let idleOn=false, idleTimer=null, idleLastWrite=0;
+function idleMinutes(){
+  const n=parseInt(siteSettings&&siteSettings.access&&siteSettings.access.idleMinutes,10);
+  return isNaN(n)?15:Math.max(0,n);
+}
+function idleTouch(force){
+  const now=Date.now(); if(!force && now-idleLastWrite<2000) return;
+  idleLastWrite=now; try{ localStorage.setItem(IDLE_KEY,String(now)); }catch(e){}
+}
+function idleLast(){
+  try{ const t=parseInt(localStorage.getItem(IDLE_KEY),10); if(t) return t; }catch(e){}
+  return idleLastWrite||Date.now();
+}
+async function idleCheck(){
+  if(!idleOn) return;
+  const m=idleMinutes(); if(!m) return;
+  if(Date.now()-idleLast()>=m*60000){
+    idleStop();
+    showToast('You were logged out after '+m+' minutes of inactivity.');
+    try{ await doLogout(); }catch(e){ console.warn(e); }
+  }
+}
+function idleStart(){
+  if(idleOn) return; idleOn=true;
+  IDLE_EVTS.forEach(ev=>window.addEventListener(ev,()=>idleTouch(false),{passive:true}));
+  idleTimer=setInterval(idleCheck,10000);
+  idleCheck();   // a saved login that was left idle for too long is logged out right away
+}
+function idleStop(){ idleOn=false; if(idleTimer){clearInterval(idleTimer);idleTimer=null;} }
+
 async function doLogout(){
   stopListeners();
   await auth.signOut();
@@ -1185,10 +1234,37 @@ function nextTimeline(p,status){
   tl.push({status,time:new Date().toISOString()});
   return tl;
 }
+// safe public copy of a parcel (no phone / address / amount / value / names)
+function publicCopy(p){
+  const tl=(Array.isArray(p.timeline)?p.timeline:Object.values(p.timeline||{})).map(t=>({status:t.status||'',time:t.time||''}));
+  const bd=bookingDateOf(p);
+  return { id:p.id, status:p.status||'Booked', sCity:p.sCity||'', rCity:p.rCity||'',
+           bookingDate:p.bookingDate||(bd?localDateStr(bd):''), createdAt:p.createdAt||'', timeline:tl };
+}
 async function writeStatus(pid,status){
   const p=allParcels.find(x=>x.id===pid); if(!p) return false;
-  try{ await db.ref('parcels/'+pid).update({status,timeline:nextTimeline(p,status)}); return true; }
+  const timeline=nextTimeline(p,status);
+  try{ await db.ref('parcels/'+pid).update({status,timeline}); }
   catch(e){ permissionHint(e); return false; }
+  try{ await db.ref('publicTracking/'+pid).set(publicCopy({...p,status,timeline})); }
+  catch(e){ console.warn('Public tracking update failed:',e&&e.message); showToast('Status saved, but the public tracking copy failed. Press "Sync existing parcels" on Overview.','error'); }
+  return true;
+}
+async function syncPublicTracking(){
+  const btn=document.getElementById('sync-pt-btn'),msg=document.getElementById('sync-pt-msg');
+  if(!allParcels.length){ msg.textContent='No parcels loaded yet.'; return; }
+  btn.disabled=true; msg.textContent='Syncing…';
+  try{
+    let n=0;
+    for(let i=0;i<allParcels.length;i+=100){
+      const chunk={};
+      allParcels.slice(i,i+100).forEach(p=>{ chunk['publicTracking/'+p.id]=publicCopy(p); });
+      await db.ref().update(chunk); n+=Object.keys(chunk).length;
+      msg.textContent=`Syncing… ${n}/${allParcels.length}`;
+    }
+    msg.textContent=`Done — ${n} parcels synced.`; showToast(`Public tracking synced (${n})`,'success');
+  }catch(e){ msg.textContent='Failed — check Firebase rules.'; permissionHint(e); }
+  btn.disabled=false;
 }
 async function updateStatusFromTable(pid){
   const sel=document.getElementById('bsel-'+pid); if(!sel) return;
@@ -1333,7 +1409,8 @@ function renderSettings(){
   if(settingsTab==='access'){
     h=sw('access.registrationOpen',d.access.registrationOpen,'Allow new registrations','When off, the Register tab is hidden on the login page')
       +sw('access.maintenance',d.access.maintenance,'Maintenance mode','Customers only see the maintenance screen. You can still check the site using the “Preview customer site” button.')
-      +`<div class="form-grid" style="margin-top:18px"><div class="form-group full"><label>Maintenance message</label><textarea rows="3" oninput="setDraft('access.maintenanceMessage',this.value)">${esc(d.access.maintenanceMessage)}</textarea></div></div>`;
+      +`<div class="form-grid" style="margin-top:18px"><div class="form-group full"><label>Maintenance message</label><textarea rows="3" oninput="setDraft('access.maintenanceMessage',this.value)">${esc(d.access.maintenanceMessage)}</textarea></div>
+        <div class="form-group"><label>Auto logout after inactivity (minutes)</label><input type="number" min="0" max="1440" step="1" value="${esc(d.access.idleMinutes)}" oninput="setDraft('access.idleMinutes',this.value)" placeholder="15"><span class="hint">Logs out customers and this admin panel when nobody touches the screen for this long. Use 0 to turn it off.</span></div></div>`;
   }
   if(settingsTab==='contact'){
     h=`<div class="hint" style="margin-bottom:14px">Shown to customers in the menu drawer ("Need help?") and on the login page. Leave a field empty to hide it.</div><div class="form-grid">
@@ -1384,12 +1461,14 @@ async function saveSettings(){
   if(!types.length) return fail('Add at least one parcel type.');
   if(d.announcement.enabled && !String(d.announcement.text).trim()) return fail('Type the announcement message or switch it off.');
   if(d.contact.email && !/^\S+@\S+\.\S+$/.test(d.contact.email.trim())) return fail('The contact email does not look right.');
+  const idleN=parseInt(d.access.idleMinutes,10);
+  if(isNaN(idleN)||idleN<0||idleN>1440) return fail('Auto logout minutes must be a number from 0 to 1440.');
   const payload={
     brand:{name:String(d.brand.name).trim(),tagline:String(d.brand.tagline).trim(),color:d.brand.color,logo:d.brand.logo||''},
     announcement:{enabled:!!d.announcement.enabled,type:d.announcement.type,text:String(d.announcement.text).trim()},
     menu:{book:!!d.menu.book,track:!!d.menu.track,bookings:!!d.menu.bookings,history:!!d.menu.history},
     booking:{open:!!d.booking.open,closedMessage:String(d.booking.closedMessage).trim(),cities,parcelTypes:types},
-    access:{registrationOpen:!!d.access.registrationOpen,maintenance:!!d.access.maintenance,maintenanceMessage:String(d.access.maintenanceMessage).trim()},
+    access:{registrationOpen:!!d.access.registrationOpen,maintenance:!!d.access.maintenance,maintenanceMessage:String(d.access.maintenanceMessage).trim(),idleMinutes:String(idleN)},
     contact:{phone:String(d.contact.phone).trim(),email:String(d.contact.email).trim(),whatsapp:String(d.contact.whatsapp).trim(),hours:String(d.contact.hours).trim()},
     updatedAt:new Date().toISOString(), updatedBy:(currentUser&&currentUser.email)||''
   };
